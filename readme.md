@@ -1,0 +1,2 @@
+This repo is a collection PowerShell scripts to parse the various forms of plain text logs (e.g. apache access log, application error log) and run analytics to generate metrics.
+The metrics are saved as csv files, which can be imported into InfluxDB and visualized in grafana. 

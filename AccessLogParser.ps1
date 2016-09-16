@@ -34,6 +34,9 @@ param (
     [string]$AggregatedColumns,
 
 
+    [alias("calculate")]    
+    [string]$CalculatedColumns,
+
     [parameter(Mandatory=$true)]
     [alias("timeformat")]
     [string]$time,
@@ -142,6 +145,28 @@ Begin {
     if(!$AggregatedColumns.EndsWith(";")) { $AggregatedColumns = $AggregatedColumns + ";" }
     $AggregatedColumnsConf = $([regex] "(?<column>.*?):(?<aggregate>.*?);").Matches($AggregatedColumns)
 
+
+    if(!$CalculatedColumns.EndsWith(";")) { $CalculatedColumns = $CalculatedColumns + ";" }
+    $CalculatedColumnsConf = New-Object Collections.Generic.List[PSCustomObject]    
+    
+
+    foreach($column in ([regex] "(?<column>.*?)=(?<formula>.*?);").Matches($CalculatedColumns)){
+        $formula = $column.Groups["formula"].value
+        $CalculatedColumn = $column.Groups["column"].value
+        $formulaSplitter =  [regex] "(?<Metric>.*?):(?<Aggregate>.*?)$"   
+        foreach($formulaParts in (([regex] "\[(?<column>.*?)\]").Matches($formula) | foreach {$formulaSplitter.Match($_.Groups["column"].Value)})){
+            $CalculatedColumnsConf.Add([pscustomobject]@{	
+		        CalculatedColumn =$CalculatedColumn 
+                Formula = $formula
+                Aggregate = $formulaParts.Groups["Aggregate"]
+                Metric= $formulaParts.Groups["Metric"]
+            })
+        }
+    }
+    
+
+
+
     if(!$GroupedColumns.EndsWith(";")) { $GroupedColumns = $GroupedColumns + ";" }
     $GroupedColumnsConf = New-Object Collections.Generic.List[string]
     foreach($grp in $([regex] "(?<column>.*?);").Matches($GroupedColumns))
@@ -201,6 +226,39 @@ Function ProcessEntries {
         }
                          
         }
+
+        if($CalculatedColumnsConf.Count -gt 0){
+            foreach($grp in ($aggregates | Group-Object $GroupedColumnsConf)) {
+                $values = $grp.Group
+                foreach($calcCol in ($CalculatedColumnsConf | Group-Object Formula)){
+            
+                    $entry = [ordered]@{}
+                
+                    $entry.Add("StartTime",$values[0].StartTime)
+                    
+                    if(![string]::IsNullOrEmpty($HostName )) {
+                        $entry.Add("HostName",$HostName)
+                    }
+
+                    $keys = $NameSplitter.Split($grp.Name)
+                    for ($i = 0; $i -lt $GroupedColumnsConf.Count; $i++) {
+                        $entry.Add( $GroupedColumnsConf[$i],$keys[$i])
+                    }
+                    $entry.Add("Aggregate","Formula")
+                    
+                    $formula = $calcCol.Name
+                    foreach($col in $calcCol.Group){
+                        $val = ($values | where {$_.Metric -eq $col.Metric -and $_.Aggregate -eq $col.Aggregate }).AggregateValue
+                        $formula = $formula.Replace("[$($col.Metric):$($col.Aggregate)]",$val) 
+                    }
+                    $entry.Add("Metric",$col.CalculatedColumn)
+                    $entry.Add("AggregateValue",(Invoke-Expression $formula))
+                    $aggregates.Add([PSCustomObject]$entry)
+                }
+            }
+        }
+
+
         return $aggregates
     }
 }

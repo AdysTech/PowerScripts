@@ -39,6 +39,7 @@ param (
     [string]$split,
 
     #List of fields (after they are split) to process. Usage Pattern:<column position>:<Column Name>. Separate multiple fields by a ;. e.g. "3:Timestamp;7:Url;" . Mandatory parameter.
+	#Should also contain Timestamp column.
 	[parameter(Mandatory=$true)]
     [alias("fieldmap")]
     [string]$fields,
@@ -51,7 +52,9 @@ param (
     [alias("group")]
     [string]$GroupedColumns,
 
-    #List of fields to aggregate for each groups. Usage Pattern: <Column Name>:<Aggregate Function>. Supports Sum, Average, Count and 90th Percentile. Separate multiple fields by a ;. e.g. "PageSize:Sum;TimeTaken:Percentile_90" . Mandatory parameter.
+    #List of fields to aggregate for each groups. Usage Pattern: <Column Name>:<Aggregate Function>. Supports Sum, Average, Count and 90th Percentile. 
+	#Separate multiple fields by a ;. e.g. "PageSize:Sum;TimeTaken:Percentile_90" . Mandatory parameter.
+	#These can contain simple math as well, e.g. if the value is in bytes, and output needs to be in KB, you can specify PageSize:Sum/1000;
     [parameter(Mandatory=$true)]
     [alias("aggregate")]    
     [string]$AggregatedColumns,
@@ -67,6 +70,7 @@ param (
     [string]$CalculatedColumns,
     
     #Time format used in the access log. e.g. "[dd/MMM/yyyy:HH:mm:ss" Mandatory parameter
+	#If this is split across two columns i.e. contains the delimiter, -fields should contain Date column as well.
     [parameter(Mandatory=$true)]
     [alias("timeformat")]
     [string]$time,
@@ -170,7 +174,7 @@ Begin {
     $source = Resolve-Path $source
 
     if ($fields -notmatch "Timestamp") { 
-		throw 'Error: The specified field map does not contain field "startTime" which is required'
+		throw 'Error: The specified field map does not contain field "Timestamp" which is required'
 		Exit 
 	}      	
 	
@@ -207,6 +211,21 @@ Begin {
         })
     }
 
+	#if date and time are split in two columns, adjust the time format, and build date format
+	$timeParts = $splitter.split($time)
+	if($timeParts.count -gt 1) {
+		$dateIndex = [int] ($fieldsConf | where {$_.groups["column"].Value -eq "Date"} | foreach {$_.groups["index"].Value})
+		if($dateIndex -eq $null) {
+		    throw 'Error: The specified field map does not contain field "Date" which is required when the -time format spread across two columns'
+		    Exit 
+		}
+		$timeIndex = [int] ($fieldsConf | where {$_.groups["column"].Value -eq "Timestamp"} | foreach {$_.groups["index"].Value})
+		$min = if($dateIndex -gt $timeIndex) { $timeIndex } else { $dateIndex }
+		$dateIndex = $dateIndex - $min
+		$timeIndex = $timeIndex - $min
+		$time = $timeParts[$timeIndex]
+		$date = $timeParts[$dateIndex]
+	}
 
     if(!$CalculatedColumns.EndsWith(";")) { $CalculatedColumns = $CalculatedColumns + ";" }
     $CalculatedColumnsConf = New-Object Collections.Generic.List[PSCustomObject]    
@@ -261,25 +280,32 @@ Function ProcessEntries {
                 $entry.Add("Metric",$aggr.groups["column"].Value)
                 $entry.Add("Aggregate",$aggr.groups["aggregate"].Value)
                 $values = $group.Group | Select-Object $aggr.groups["column"].Value | foreach {$_.($aggr.groups["column"].Value)}
-                switch ($entry.Aggregate){
-                    {($_ -eq 'count')} {
+                $formula = $entry.Aggregate.ToLower()
+                switch ($entry.Aggregate.ToLower()){
+                    {($_ -match 'count')} {
 					    $Value =  [Aggregator]::Count($values)
+                        $formula = $formula.Replace('count',$Value)
 					    break
 				    }
-                    {($_ -eq 'sum')} {
+                    {($_ -match 'sum')} {
 					    $Value =  [Aggregator]::Sum($values)
+                        $formula = $formula.Replace('sum',$Value)
 					    break
 				    }
-                    {($_ -eq 'average')} {
+                    {($_ -match 'average')} {
 					    $Value =  [Aggregator]::Average($values)
-					    break
+					    $formula = $formula.Replace('average',$Value)
+                        break
 				    }
-                    {($_ -eq 'Percentile_90')} {
-					    $Value =  [Aggregator]::Percentile($values,90)
+                    {($_ -match 'percentile')} {
+                        $percent  = [int] $_.Substring($_.IndexOf('percentile_') + 'percentile_'.Length,2)
+					    $Value =  [Aggregator]::Percentile($values,$percent)
+                        $formula = $formula.Replace("percentile_$percent",$Value)
 					    break
 				    }
                 }
-                $entry.Add("AggregateValue",$Value)
+                $entry.Add("AggregateValue",(Invoke-Expression $formula))
+                #$entry.Add("AggregateValue",$Value)
                 $aggregates.Add([PSCustomObject]$entry)
             }
         }
@@ -327,6 +353,7 @@ process{
     $entries = New-Object Collections.Generic.List[PSCustomObject]
     $summarylist = New-Object Collections.Generic.List[PSCustomObject]
     [datetime]$ts = New-Object DateTime
+    [datetime]$dt = New-Object DateTime
     $lastWriteTs = $ts
     $linecount = 0
     $completedLines = 0
@@ -354,10 +381,17 @@ process{
                 }
                 $hash.add($field.groups["column"].Value, $value)
             }
+			
             $out = [PSCustomObject]$hash
             #bucket the time stamp into time slots
             [DateTime]::TryParseExact($out.Timestamp,$time,[System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$ts) | Out-Null
             
+            if($dateIndex -ne $null) {                
+                [DateTime]::TryParseExact($out.Date,$date,[System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::None, [ref]$dt) | Out-Null
+                $ts = $dt.AddTicks( $ts.Ticks - [DateTime]::Today.Ticks)
+
+            }
+
             $out.Timestamp = $ts.AddMinutes( - $ts.Minute % $Interval).AddSeconds( - $ts.Second)
             $entries.Add($out) 
             if($entries.Count -gt $batchSize) {

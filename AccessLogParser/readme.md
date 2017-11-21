@@ -18,7 +18,7 @@ Usually access logs capture information for each hit, and that is too much infor
 
 ####    -fields <String>
         List of fields (after they are split) to process. Usage Pattern:<column position>:<Column Name>. Separate
-        multiple fields by a ;. e.g. "3:Timestamp;7:Url;" . Mandatory parameter.
+        multiple fields by a ;. e.g. "3:Timestamp;7:Url;" . Mandatory parameter. Should also contain Timestamp column.
 
 ####    -HostName <String>
         Hostname from where the log came from. Optional, but recommended
@@ -30,7 +30,9 @@ Usually access logs capture information for each hit, and that is too much infor
 ####    -AggregatedColumns <String>
         List of fields to aggregate for each groups. Usage Pattern: <Column Name>:<Aggregate Function>. Supports Sum,
         Average, Count and 90th Percentile. Separate multiple fields by a ;. e.g.
-        "PageSize:Sum;TimeTaken:Percentile_90" . Mandatory parameter.
+        "PageSize:Sum;TimeTaken:Percentile_90" . Mandatory parameter. 
+	These can contain simple math as well, e.g. if the value is in bytes, and output needs to be in KB, 
+	it could be expressed as `PageSize:Sum/1000`;
 
 ####    -Filters <String>
         Filters to apply on column values. Usage Pattern: <Column Name>:<reg ex>. Separate multiple filters by a ;.
@@ -42,7 +44,8 @@ Usually access logs capture information for each hit, and that is too much infor
         "Concurrency=(([HttpCode:Count]/300)*([TimeTaken:Average]/1000))" . Mandatory parameter.
 
 ####    -time <String>
-        Time format used in the access log. e.g. "[dd/MMM/yyyy:HH:mm:ss" Mandatory parameter
+        Time format used in the access log. e.g. "[dd/MMM/yyyy:HH:mm:ss" Mandatory parameter. 
+		If this is split across two columns i.e. contains the delimiter, -fields should contain Date column as well.
 
 ####    -Interval <Int32>
         Time interval in minutes to collapse the log entries. Default: 1 min.

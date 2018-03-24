@@ -62,3 +62,6 @@ Usually access logs capture information for each hit, and that is too much infor
 ####    -minHits <Int32>
         Minimum number of hits in a given interval, any interval with less number of total hits will be ignored.
         Default is 5.
+
+####    -UrlExtract <String>
+        RegEx to extract only part of URL. Useful if the URL has any session ID etc. By default any query parameters are moved e.g. default is "\?(.*)$|;(.*)$" . Optional parameter. This RegExp is ap;lied on the URL and anything that matches will be excluded from the rest of the processing (e.g. grouping etc)

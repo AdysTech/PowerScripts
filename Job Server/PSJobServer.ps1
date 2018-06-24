@@ -31,83 +31,15 @@ Param (
     [string] $primaryGroup = "PsJobSchedulers"
 )
 
-#region Variables and Initialize
+$DebugPreference = "Continue"
 $VerbosePreference = "Continue"
 
-write-verbose "$([datetime]::now.tostring()) Starting $(split-path -Leaf $MyInvocation.MyCommand.Definition ) process"
- 
+write-verbose "$([datetime]::now.tostring()) Starting $(split-path -Leaf $MyInvocation.MyCommand.Definition ) process - PID : $pid"
+
 $workingDir = split-path -parent $MyInvocation.MyCommand.Definition
-   
-[System.Net.AuthenticationSchemes] $Auth = [System.Net.AuthenticationSchemes]::IntegratedWindowsAuthentication
-$jobWatcherTimer = new-object System.Timers.Timer(20000)
-$listener = New-Object System.Net.HttpListener
-$jobQueue = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
-$jobCollection = New-Object Collections.Generic.List[PSCustomObject]
-[long] $requestCount = 0
-[long] $errorCount = 0
-$MaxActiveProcess = 2
-$runspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxActiveProcess)
-#endregion
- 
-#region Functions
 
-#
-$jobWatchercallback = { 
-    $modified = $false
-    try {
-        if ($jobQueue.Count -gt 0 -or $jobCollection.Count -gt 0) {
-            $mtx = New-Object System.Threading.Mutex($false, "Global\PSJobMutex")
-            if (-not $mtx.WaitOne(2000)) {
-                return 
-            }
-            $path = $(Resolve-path ".\ProcessStatus.json")
-            $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
-            if ($jobQueue.Count -gt 0) {
-                while ($jobQueue.Count -gt 0) {
-                    $arguemnts = $jobQueue.Dequeue()
-
-                    $PSinstance = [PowerShell]::Create()
-                    $PSinstance.AddScript( {$VerbosePreference = "Continue"}, $false).Invoke()
-                    $PSinstance.AddScript($ExecuteScriptAsync).AddArgument($arguemnts.WorkingDir).AddArgument($arguemnts.Script).AddArgument($arguemnts.CommandArgs).AddArgument($arguemnts.RunId)
-                    $PSinstance.RunspacePool = $runspacePool
-                    $jobCollection.Add([pscustomobject]@{
-                            Runspace   = $PSinstance.BeginInvoke()
-                            PowerShell = $PSinstance
-                            RunID      = $arguemnts.RunId
-                        })
-
-                    $process = $statusEntries.Processes | Where-Object {$_.RunId -eq $arguemnts.RunId}
-                    $process.Status = "Started"
-                    $modified = $true
-                }
-            }
-            elseif ($jobCollection.Count -gt 0) {
-                foreach ($job in ($jobCollection | Where-Object {$_.Runspace.IsCompleted})) {                    
-                    $process = $statusEntries.Processes | Where-Object {$_.RunID -eq $job.RunID}                    
-                    $log = ".\Logs\$($job.RunID).log"
-                    #read both verbose and output streams              
-                    $entries = $job.PowerShell.Streams.Verbose.ReadAll()
-                    $entries += $job.PowerShell.EndInvoke($job.Runspace)
-                     
-                    $entries | Out-File -FilePath $log -Append | out-null
-                    $job.PowerShell.Dispose()
-                    $jobCollection.Remove($job)
-                }   
-                $modified = $true
-            }
-            if ($modified) {
-                $statusEntries | ConvertTo-Json -Depth 999 | Out-File $path
-            }
-            $mtx.ReleaseMutex()
-        }
-    }
-    catch [Exception] { 
-        write-error "Timer callback Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)" -ErrorAction Continue
-    }
-}
-
-# This executes the passed script asynchronously. It updates the status entries as well
-$ExecuteScriptAsync = {
+#region declare functions
+function ExecuteScriptAsync {
     param (
         [ValidateNotNullOrEmpty()]
         [parameter(Mandatory = $true)]
@@ -119,45 +51,62 @@ $ExecuteScriptAsync = {
         [parameter(Mandatory = $true)]
         [PSCustomObject] $arguments,
         [int] $runId
-    )
-            
+    )    
     Set-Location $workingDir
     $path = $(Resolve-path ".\ProcessStatus.json")
     $mtx = New-Object System.Threading.Mutex($false, "Global\PSJobMutex")
     $retryCount = 0    
     while ($retryCount -lt 6) {
-        if ($mtx.WaitOne(5000)) {
+        $retryCount = $retryCount + 1
+        if ($mtx.WaitOne(1000)) {           
             break
         }
     }
-    if ($retryCount -eq 6) {write-error "Unable to get lock on process file" -ErrorAction Stop; return}
-    
-    $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
-    $process = $statusEntries.Processes | Where-Object {$_.RunId -eq $runId}
-    $process.Status = "Processing"
-    $statusEntries | ConvertTo-Json -Depth 999 | Out-File $path            
-    $mtx.ReleaseMutex()
- 
+    if ($retryCount -eq 6) {
+        write-verbose "Unable to hold lock to mark starting job"
+        return
+    }
+    try {
+     
+        $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
+        $process = $statusEntries.Processes | Where-Object {$_.RunId -eq $runId}
+        $process.Status = "Processing"
+        $statusEntries | ConvertTo-Json -Depth 100 | Out-File $path    
+    }
+    finally {        
+        $mtx.ReleaseMutex()
+    }
+    #$arg = $arguments | Get-Member -MemberType Properties | ForEach-Object { "-$($_.Name) $($arguments.($_.Name))"}              
+    #$scriptresult = Invoke-Expression "& $scriptFileName $arg"
+            
     $arguments | & $scriptFileName
 
-    $log = ".\Logs\$runId.log"
-    New-Item $log -Force -ItemType File | out-null
     #Set-Content $log $scriptresult
-
-    $mtx = New-Object System.Threading.Mutex($false, "Global\PSJobMutex")
-    if (-not $mtx.WaitOne(2000)) {
-        return $false
+    while ($retryCount -lt 6) {
+        $retryCount = $retryCount + 1
+        if ($mtx.WaitOne(1000)) {           
+            break
+        }
     }
-    $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
-    $process = $statusEntries.Processes | Where-Object {$_.RunId -eq $runId}
-    $process.EndTime = [DateTime]::Now
-    $process.Status = "Completed"
-    $statusEntries | ConvertTo-Json -Depth 999 | Out-File $path            
-    $mtx.ReleaseMutex()
+    if ($retryCount -eq 6) {
+        write-verbose "Unable to hold lock to mark job complete"
+        return $false
+    }  
+    
+    try {
+  
+        $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
+        $process = $statusEntries.Processes | Where-Object {$_.RunId -eq $runId}
+        $process.EndTime = [DateTime]::Now
+        $process.Status = "Completed"
+        $statusEntries | ConvertTo-Json -Depth 100 | Out-File $path            
+    }
+    finally {
+        $mtx.ReleaseMutex()
+    }
     return $true
 }
 
-# This executes the passed script synchronously and returns resutlts in an array, which can be serialized to json
 Function ExecuteScript {
     param (
         [ValidateNotNullOrEmpty()]
@@ -166,7 +115,9 @@ Function ExecuteScript {
         [ValidateNotNullOrEmpty()]
         [parameter(Mandatory = $true)]
         [PSCustomObject] $arguments
-    )             
+    )
+                
+    #$arg = $arguments | Get-Member -MemberType Properties | ForEach-Object { "-$($_.Name) $($arguments.($_.Name))"}              
     $scriptresult = $arguments | & $scriptFileName
         
     return , $scriptresult
@@ -187,12 +138,8 @@ Function Log-AuditMessage {
 }
 
 Function GetProcessStatus {
-    $mtx = New-Object System.Threading.Mutex($false, "Global\PSJobMutex")
-    if (-not $mtx.WaitOne(2000)) {
-        return $null
-    }
+    #read only transaction.. may not get latest one in a race condition
     $statusEntries = Get-Content -Raw -Path $(Resolve-path "./ProcessStatus.json") | ConvertFrom-Json
-    $mtx.ReleaseMutex()
     return $statusEntries
 }
 
@@ -202,14 +149,31 @@ Function UpdateProcessStatus {
         [pscustomobject] $process
     )
     $mtx = New-Object System.Threading.Mutex($false, "Global\PSJobMutex")
+    
     if (-not $mtx.WaitOne(2000)) {
+        write-verbose "Unable to hold lock to UpdateProcessStatus"
         return $false
     }
-    $path = $(Resolve-path ".\ProcessStatus.json")
-    $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
-    $statusEntries.Processes += $process
-    $statusEntries | ConvertTo-Json -Depth 999 | Out-File $path
-    $mtx.ReleaseMutex()|Out-Null
+    try {
+        $path = $(Resolve-path ".\ProcessStatus.json")
+        $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
+        if ($statusEntries -eq $null) {
+            $statusEntries = @{Processes = @()}
+        }
+        else {
+            if (-not ($statusEntries.Processes -is [array])) {
+                $t = $statusEntries.Processes
+                $statusEntries.Processes = @()
+                $statusEntries.Processes += $t
+            }
+        }
+        $statusEntries.Processes += $process
+        $statusEntries | ConvertTo-Json -Depth 100 | Out-File $path
+    }
+    finally {
+        $mtx.ReleaseMutex()
+    }
+ 
     return $true
 }
 
@@ -220,26 +184,31 @@ Function ArchiveProcessEntries {
     )
     $mtx = New-Object System.Threading.Mutex($false, "Global\PSJobMutex")
     if (-not $mtx.WaitOne(2000)) {
+        write-verbose "Unable to hold lock to ArchiveProcessStatus"
         return $false
     }
-    $path = $(Resolve-path ".\ProcessStatus.json")
+    try {
+        $path = $(Resolve-path ".\ProcessStatus.json")
 
-        
-    $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
-    $now = [DateTime]::Now
-    $archiveEntries = $statusEntries.Processes | Where-Object { $_.Status -eq "Completed" -and $_.StartTime + $TimeToLive -lt $now}
-    $statusEntries.Processes = $statusEntries.Processes | Where-Object { $_.Status -ne "Completed" -or $_.StartTime + $TimeToLive -gt $now}
-    $statusEntries | ConvertTo-Json -Depth 999 | Out-File $path
+            
+        $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
+        $now = [DateTime]::Now
+        $archiveEntries = $statusEntries.Processes | Where-Object { $_.Status -eq "Completed" -and $_.StartTime + $TimeToLive -lt $now}
+        $statusEntries.Processes = $statusEntries.Processes | Where-Object { $_.Status -ne "Completed" -or $_.StartTime + $TimeToLive -gt $now}
+        $statusEntries | ConvertTo-Json -Depth 100 | Out-File $path
 
-    $archive = ".\ProcessArchive-$($now.ToString('MMM')).json"
-    if (-not(test-path $archive)) {
-        New-Item $archive -Force -ItemType File | out-null
+        $archive = ".\ProcessArchive-$($now.ToString('MMM')).json"
+        if (-not(test-path $archive)) {
+            New-Item $archive -Force -ItemType File | out-null
+        }
+        else {
+            $archiveEntries += (Get-Content -Raw -Path $archive | ConvertFrom-Json).Processes
+        }
+        $archiveEntries | ConvertTo-Json -Depth 100 | Out-File $archive
     }
-    else {
-        $archiveEntries += (Get-Content -Raw -Path $archive | ConvertFrom-Json).Processes
+    finally {
+        $mtx.ReleaseMutex()
     }
-    $archiveEntries | ConvertTo-Json -Depth 999 | Out-File $archive
-    $mtx.ReleaseMutex()|Out-Null
     return $true
 }
 
@@ -268,7 +237,7 @@ function Send-Response {
         JSON {
             $response.ContentType = "application/json"
             $response.AddHeader("Expires", "29");
-            $buffer = [System.Text.Encoding]::UTF8.GetBytes(($responseData | ConvertTo-JSON -depth 999))
+            $buffer = [System.Text.Encoding]::UTF8.GetBytes(($responseData | ConvertTo-JSON -Depth 100))
             break
         }
         TEXT {
@@ -287,193 +256,358 @@ function Send-Response {
 #endregion
 
 
+$jobOutput = [hashtable]::Synchronized(@{})
+$jobQueue = [System.Collections.Queue]::Synchronized((New-Object System.Collections.Queue))
+$sessionstate = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+
+#region setup InitialSessionState
+#add all locally defined functions to runspace
+$MyInvocation.MyCommand.ScriptBlock.Ast.EndBlock.Statements.Where( {$_ -is [Management.Automation.Language.FunctionDefinitionAst]}).foreach( {
+        $funcName = $_.Name
+        $sessionstate.Commands.Add((New-Object System.Management.Automation.Runspaces.SessionStateFunctionEntry($funcName, (Get-Content function:\$funcName))))
+    })
+
+$sessionstate.Variables.Add(
+    (New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('jobOutput', $jobOutput, $null))
+)
+
+$sessionstate.Variables.Add(
+    (New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('jobQueue', $jobQueue, $null))
+)
+
+$sessionstate.Variables.Add(
+    (New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('DebugPreference', "Continue", $null))
+)
+
+$sessionstate.Variables.Add(
+    (New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry('VerbosePreference', "Continue", $null))
+)
+#endregion
+
+
+$jobWatchercallback = {     
+    $VerbosePreference = "Continue"
+    $DebugPreference = "Continue"
+    
+    try {
+        if ($Event.MessageData.jobQueue.Count -gt 0 -or $Event.MessageData.jobOutput.Count -gt 0) {
+            while ($Event.MessageData.jobQueue.Count -gt 0) {                    
+                $arguemnts = $Event.MessageData.jobQueue.Dequeue()
+                try {                    
+                    $PSinstance = [PowerShell]::Create()                    
+                    $PSinstance.AddCommand("ExecuteScriptAsync").AddArgument($arguemnts.WorkingDir).AddArgument($arguemnts.Script).AddArgument($arguemnts.CommandArgs).AddArgument($arguemnts.RunId)
+                    $PSinstance.RunspacePool = $Event.MessageData.runspacePool
+                    $Event.MessageData.jobOutput.$("Job$($arguemnts.RunId)") = ([PSCustomObject]@{
+                            Runspace   = $PSinstance.BeginInvoke()
+                            PowerShell = $PSinstance
+                            RunID      = $arguemnts.RunId
+                        })
+                    Write-Verbose "$([datetime]::Now) Started async processing $($arguemnts.RunId) with $($arguemnts.CommandArgs)"
+                }
+                catch [Exception] { 
+                    write-verbose "Error starting the RunSpace $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
+                    $Event.MessageData.jobQueue.Enqueue($arguemnts)
+                }                    
+            }        
+            $Event.MessageData.jobOutput.GetEnumerator().Where( {$_.Value.Runspace.IsCompleted}).foreach( {
+                    $job = $_.Value
+                    Write-Verbose "$([datetime]::Now) Finalize async processing for $($job.RunId)"
+                    $log = ".\Logs\$($job.RunID).log"
+                    $job.PowerShell.Streams.Debug.ReadAll() | Write-Debug 
+                    $entries = New-Object Collections.Generic.List[string]
+                    $verb = $job.PowerShell.Streams.Verbose.ReadAll()
+                    if ($verb -ne $null) {
+                        $entries.Add("Details`n")
+                        $entries.Add("----------------------------------------------`n")
+                        $verb |foreach-Object {$entries.Add($_.ToString())}
+                    }
+                    $err = $job.PowerShell.Streams.Error.ReadAll()
+                    if ($err -ne $null) {
+                        $entries.Add("Errors`n")
+                        $entries.Add( "----------------------------------------------`n")
+                        $err |foreach-Object {$entries.Add($_.ToString())}
+                    }
+                    $entries.Add("Output`n")
+                    $entries.Add( "----------------------------------------------`n")
+                    $out = $job.PowerShell.EndInvoke($job.Runspace)
+                    
+                    if ($out -ne $null) {
+                        $out|foreach-Object {if ($_ -ne $null) {[string]$o = $_; $entries.Add($o)}
+                        }
+                    }
+                    $entries | Out-File -FilePath $log -Append | out-null
+                    $job.PowerShell.Dispose()
+                    $Event.MessageData.jobOutput.Remove("Job$($job.RunId)")
+                })            
+        }
+    }
+    catch [Exception] { 
+        write-verbose "Timer callback Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
+    }
+    return $true
+}
+
+$listenerCallback = {
+    param (
+        [ValidateNotNullOrEmpty()]
+        [parameter(Mandatory = $true)]
+        [string] $workingDir,            
+        [ValidateNotNullOrEmpty()]
+        [parameter(Mandatory = $true)]
+        [System.Net.HttpListener] $listener,
+        [ValidateNotNullOrEmpty()]
+        [parameter(Mandatory = $true)]
+        [string] $primaryGroup
+    )
+
+    try {
+        while ($listener.IsListening) {
+            try {
+                $context = $listener.GetContext()
+                $statusCode = 200
+                $requestCount = $requestCount + 1
+                $runId = [long] ([datetime]::UtcNow - [datetime]::FromBinary(630822816000000000)).TotalSeconds
+                #write-verbose "$requestCount  -  Received a request - $runID"
+                
+                $request = $context.Request
+                    
+                if (!$request.IsAuthenticated) {
+                    $statusCode = 403
+                    $commandOutput = @{Success = $false; Error = "Unauthorized"; Message = "Rejected request as user was not authenticated"}
+                }
+                else {
+                    $user = $context.User.Identity.Name
+                    Log-AuditMessage "RunID:$runID User:$user  Request:$($request.QueryString)"  
+                    
+                    # only allow requests that are part of allowed group
+                    if (-not $context.User.IsInRole($primaryGroup)) {
+                        $statusCode = 403
+                        $commandOutput = @{Success = $false; Error = "Unauthorized"; Message = "Rejected request as user is not in allowed group"}
+                    }
+                    else {
+                        if (-not $request.QueryString.HasKeys()) {
+                            $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "No Input provided!! Refer to user guide"}
+                        }
+                        else {
+                            $command = $request.QueryString.Item("command").ToLower()
+                            $postArgs = $null
+                            $commandArgs = @{}
+
+                            if ($request.HttpMethod -eq "POST" -and $request.HasEntityBody) {
+                                try {                            
+                                    $reader = New-Object System.IO.StreamReader($request.InputStream)
+                                    $arg = $reader.ReadToEnd()
+                                    $postArgs = $arg | ConvertFrom-Json
+                                }
+                                catch {
+                                    $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "Invalid POST data!! Refer to user guide"}
+                                }
+                                finally {
+                                    $reader.Close()
+                                }
+                            }
+                            
+                            switch ($command) {
+                                status {
+                                    $processes = $(GetProcessStatus).Processes
+                                    
+                                    if ( $request.QueryString["runid"] -ne $null) {                                
+                                        $commandOutput = @{Success = $True; RunID = $runId; Process = ($Processes | Where-Object {$_.RunId -eq $request.QueryString["runid"]})}
+                                    }
+                                    else {
+                                        $commandOutput = @{Success = $True; RunID = $runId; Processes = $processes}    
+                                    }
+                                    break
+                                }
+                                archivejobs {
+                                    $res = ArchiveProcessEntries $([TimeSpan]::FromHours(24))
+                                    $processes = $(GetProcessStatus).Processes
+                                    $commandOutput = @{Success = $res; RunID = $runId; Processes = $processes}    
+                                    break
+                                }
+                                runoutput {
+                                    if ( $request.QueryString["runid"] -ne $null) {
+                                        $log = ".\Logs\$($request.QueryString["runid"]).log"
+                                        if ((Test-Path $log) -and ($content = $((Get-Content $log) -join "`n`n")) -and (-not([string]::IsNullOrEmpty($content)))) {
+                                            try {
+                                                Send-Response $statusCode $context.Response "TEXT" $((Get-Content $log) -join "`n")
+                                            }
+                                            catch {
+                                                $statusCode = 500
+                                                @{Success = $false; Error = "UnableToProcess"; Message = "Unable to Process request"}; 
+                                            }
+                                        }
+                                        else {
+                                            Send-Response 404 $context.Response "TEXT" "File Not Found"
+                                        }
+                                        continue
+                                    }
+                                    break
+                                }
+                                Default {
+                                  
+    
+                                    $script = "./Execute_$command.ps1" 
+                                    if (-not(Test-Path $script)) {
+                                        $statusCode = 500
+                                        @{Success = $false; Error = "InvalidInput"; Message = "Command $command is not known!!"}; 
+                                    }
+                                    else {  
+                                        $script = Resolve-Path $script
+                                        if ( $request.QueryString["async"] -ne $null) {                                          
+                                            if ($postArgs -eq $null) {
+                                                $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "Invalid POST data!! Refer to user guide"}
+                                            }
+                                            else {
+                                                
+                                                $process = [PsCustomObject] @{
+                                                    StartTime = [DateTime]::Now
+                                                    User      = $user
+                                                    Command   = $command
+                                                    Status    = "Queued"
+                                                    RunID     = $runId
+                                                    EndTime   = $null
+                                                    Arguments = $postArgs
+                                                }
+                                                
+                                                if ( UpdateProcessStatus $process) {
+                                                    
+                                                    $jobQueue.Enqueue([pscustomobject]@{
+                                                            WorkingDir  = $workingDir
+                                                            Script      = $script 
+                                                            CommandArgs = $postArgs 
+                                                            RunId       = $runId
+                                                        })
+                                                    
+                                                    Write-Debug "$([datetime]::Now) Queued request $runId, Queue Length: $($jobQueue.Count)"
+                                                    
+                                                    $commandOutput = @{Success = $True; RunID = $runId; Process = $process}
+                                                }
+                                                else {
+                                                    $commandOutput = @{Success = $False; RunID = $runId; Process = $process}
+                                                }
+                                            }
+                                            
+                                        }
+                                        else {
+                                            try {
+                                                $commandArgs = @{}
+                                                $request.QueryString.Keys | ForEach-Object {$commandArgs.Add($_, $request.QueryString[$_])}
+                                                if ($postArgs -ne $null) {
+                                                    $postArgs | Get-Member -MemberType NoteProperty |ForEach-Object {
+                                                        if (-not $commandArgs.ContainsKey($_.Name)) {
+                                                            $commandArgs.Add($_.Name, $postArgs.($_.Name))
+                                                        }
+                                                    }
+                                                    
+                                                }
+                                                
+                                                $results = ExecuteScript -script $script -arguments $([pscustomobject]$commandArgs)
+                                                $commandOutput = @{Success = $True; RunID = $runId; Results = @($results) }
+                                            }
+                                            catch {
+                                                write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
+                                                @{Success = $false; Error = "UnableToProcess"; Message = "Unable to Process request"}; 
+                                                $statusCode = 500
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                        }
+                    }
+                }
+    
+                
+                if (!$commandOutput) {
+                    $commandOutput = " "
+                }
+    
+                Log-AuditMessage "RunID:$runID  StatusCode:$statusCode  Success:$($commandOutput.Success)   Error:$($commandOutput.Error) Message:$($commandOutput.Message)"
+                send-response $statusCode $context.Response "JSON" $commandOutput
+            }
+            catch [Exception] { 
+                write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
+                $errorCount = $errorCount + 1
+            }
+        }    
+        
+    }
+    catch [Exception] { 
+        write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
+    }
+}
+
+
+
+$MaxActiveProcess = $env:NUMBER_OF_PROCESSORS - 2
+$runspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxActiveProcess, $sessionstate, $Host)
+
+
+$jobWatcherTimer = new-object System.Timers.Timer
+$jobWatcherTimer.Interval = 5000
+$jobWatcherTimer.AutoReset = $true
+$jobWatcherTimer.Enabled = $true
+$timerState = [PSObject] @{JobQueue = $jobQueue; jobOutput = $jobOutput; RunspacePool = $runspacePool}
+Register-ObjectEvent -InputObject $jobWatcherTimer -EventName Elapsed -SourceIdentifier  timerEvntId -Action $jobWatchercallback -MessageData $timerState | Out-Null
 $ErrorActionPreference = "Stop"
-$CommandKeywords = "status;archivejobs;runoutput;"
 
 $CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal( [Security.Principal.WindowsIdentity]::GetCurrent())
 
 if ( -not ($currentPrincipal.IsInRole( [Security.Principal.WindowsBuiltInRole]::Administrator ))) {
-    write-error "This script must be executed from an elevated PowerShell session" -ErrorAction Stop 
+    write-verbose "This script must be executed from an elevated PowerShell session" -ErrorAction Stop
 }
 
 if ($Url.Length -gt 0 -and -not $Url.EndsWith('/')) {
     $Url += "/"
 }
 
+
+[System.Net.AuthenticationSchemes] $Auth = [System.Net.AuthenticationSchemes]::IntegratedWindowsAuthentication
+$listener = New-Object System.Net.HttpListener
 $prefix = "http://*:$Port/$Url"
 $listener.Prefixes.Add($prefix)
 $listener.AuthenticationSchemes = $Auth 
 
-#region main block
 try {
-    Register-ObjectEvent -InputObject $jobWatcherTimer -EventName Elapsed -SourceIdentifier  timerEvntId -Action $jobWatchercallback 
-    $jobWatcherTimer.start()
     $runspacePool.Open()
-    $listener.Start()
-
+    $listener.Start()   
+    #start the main listener thread
+    $PSinstance = [PowerShell]::Create()    
+    $PSinstance.AddScript($listenerCallback) | Out-Null
+    $PSinstance.AddParameter("primaryGroup", $primaryGroup)| Out-Null
+    $PSinstance.AddParameter("listener", $listener)| Out-Null
+    $PSinstance.AddParameter("WorkingDir", $WorkingDir)| Out-Null
+    $PSinstance.RunspacePool = $runspacePool
+    $listenerLoop = $PSinstance.BeginInvoke()
+    
+    $jobWatcherTimer.start()
+    
     while ($true) {
-        try {
-            $context = $listener.GetContext()
-            $statusCode = 200
-            $requestCount = $requestCount + 1
-            $runId = [long] ([datetime]::UtcNow - [datetime]::FromBinary(630822816000000000)).TotalSeconds
-            write-verbose "$requestCount  -  Received a request - $runID"
-            
-            $request = $context.Request
-
-            if (!$request.IsAuthenticated) {
-                $statusCode = 403
-                $commandOutput = @{Success = $false; Error = "Unauthorized"; Message = "Rejected request as user was not authenticated"}
-            }
-            else {
-                $user = $context.User.Identity.Name
-                Log-AuditMessage "RunID:$runID User:$user  Request:$($request.QueryString)"                
-                # only allow requests that are part of allowed group
-                if (-not $context.User.IsInRole($primaryGroup)) {
-                    $statusCode = 403
-                    $commandOutput = @{Success = $false; Error = "Unauthorized"; Message = "Rejected request as user is not in allowed group"}
-                }
-                else {
-                    if (-not $request.QueryString.HasKeys()) {
-                        $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "No Input provided!! Refer to user guide"}
-                    }
-                    else {
-                        $command = $request.QueryString.Item("command").ToLower()
-                        if ($request.HttpMethod -eq "POST" -and $request.HasEntityBody) {
-                            try {                            
-                                $reader = New-Object System.IO.StreamReader($request.InputStream)
-                                $arg = $reader.ReadToEnd()
-                                $commandArgs = $arg | ConvertFrom-Json
-                            }
-                            catch {
-                                $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "Invalid POST data!! Refer to user guide"}
-                            }
-                            finally {
-                                $reader.Close()
-                            }
-                        }
-                       
-                        switch ($command) {
-                            status {
-                                $processes = $(GetProcessStatus).Processes
-                                
-                                if ( $request.QueryString["runid"] -ne $null) {                                
-                                    $commandOutput = @{Success = $True; RunID = $runId; Process = ($Processes | Where-Object {$_.RunId -eq $request.QueryString["runid"]})}
-                                }
-                                else {
-                                    $commandOutput = @{Success = $True; RunID = $runId; Processes = $processes}    
-                                }
-                                break
-                            }
-                            archivejobs {
-                                ArchiveProcessEntries $([TimeSpan]::FromHours(24))
-                                $processes = $(GetProcessStatus).Processes
-                                $commandOutput = @{Success = $True; RunID = $runId; Processes = $processes}    
-                                break
-                            }
-                            runoutput {
-                                if ( $request.QueryString["runid"] -ne $null) {
-                                    $log = ".\Logs\$($request.QueryString["runid"]).log"
-                                    if ((Test-Path $log) -and ($content = $((Get-Content $log) -join "`n`n")) -and (-not([string]::IsNullOrEmpty($content)))) {
-                                        try {
-                                            Send-Response $statusCode $context.Response "TEXT" $((Get-Content $log) -join "`n")
-                                        }
-                                        catch {
-                                            $statusCode = 500
-                                            @{Success = $false; Error = "UnableToProcess"; Message = "Unable to Process request"}; 
-                                        }
-                                    }
-                                    else {
-                                        Send-Response 404 $context.Response "TEXT" "File Not Found"
-                                    }
-                                    continue
-                                }
-                                break
-                            }
-                            Default {
-                                $script = "./Execute_$command.ps1" 
-                                    
-                                if (-not(Test-Path $script)) {
-                                    $statusCode = 500
-                                    @{Success = $false; Error = "InvalidInput"; Message = "Command $command is not known!!"}; 
-                                }
-                                else {
-                                    $script = Resolve-Path $script
-
-                                    if ( $request.QueryString["async"] -ne $null) {
-                                        if ($commandArgs -eq $null) {
-                                            $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "Invalid POST data!! Async requires POST parameters"}
-                                        }
-                                        else {
-                                            $process = [PsCustomObject] @{
-                                                StartTime = [DateTime]::Now
-                                                User      = $user
-                                                Command   = $command
-                                                Status    = "Queued"
-                                                RunID     = $runId
-                                                EndTime   = $null
-                                                Arguments = $commandArgs
-                                            }
-
-                                            if ( UpdateProcessStatus $process) {
-                                                #ExecuteScriptAsync $workingDir $script $commandArgs $runId
-                                                $jobQueue.Enqueue([pscustomobject]@{
-                                                        WorkingDir  = $workingDir
-                                                        Script      = $script 
-                                                        CommandArgs = $commandArgs 
-                                                        RunId       = $runId
-                                                    })
-                                                
-                                                $commandOutput = @{Success = $True; RunID = $runId; Process = $process}
-                                            }
-                                            else {
-                                                $commandOutput = @{Success = "False"; RunID = $runId; Process = $process}
-                                            }
-                                        }
-                                        
-                                    }
-                                    else {
-                                        try {
-                                            $commandArgs = @{}
-                                            $request.QueryString.Keys | ForEach-Object {$commandArgs.Add($_, $request.QueryString[$_])}
-                                            $results = ExecuteScript -script $script -arguments $([pscustomobject]$commandArgs)
-                                            $commandOutput = @{Success = $True; RunID = $runId; Results = $results }
-                                        }
-                                        catch {
-                                            write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
-                                            @{Success = $false; Error = "UnableToProcess"; Message = "Unable to Process request"}; 
-                                            $statusCode = 500
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        
-                    }
-                }
-            }
-
-            
-            if (!$commandOutput) {
-                $commandOutput = " "
-            }
-
-            Log-AuditMessage "RunID:$runID  StatusCode:$statusCode  Success:$($commandOutput.Success)   Error:$($commandOutput.Error) Message:$($commandOutput.Message)"
-            send-response $statusCode $context.Response "JSON" $commandOutput
-        }
-        catch [Exception] { 
-            write-error "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)" -ErrorAction Continue
-            $errorCount = $errorCount + 1
-        }
-         
+        Start-Sleep -Milliseconds 1000
+        $PSinstance.Streams.Verbose.ReadAll() | Write-Verbose -Verbose
+        $PSinstance.Streams.Debug.ReadAll() | Write-Debug 
+        $PSinstance.Streams.Verbose.Clear()
+        $PSinstance.Streams.Debug.Clear()
     }
 }
+
 catch [Exception] { 
-    write-error "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)" -ErrorAction Continue
+    write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
 }
+
 finally {
+    Write-debug "$([datetime]::Now) Shutting down"
+    Get-EventSubscriber -Force | Unregister-Event -Force
+    $jobWatcherTimer.stop()
     $listener.Stop()
-    $jobWatcherTimer.stop() 
-    Unregister-Event timerEvntId 
+    start-sleep -Milliseconds 100
+    $PSinstance.EndInvoke($listenerLoop)    
+    $PSinstance.Dispose()
+    $runspacePool.Close()
+    $runspacePool.Dispose()    
+    
+    Write-debug "$([datetime]::Now) Good bye.."
 }
 #endregion

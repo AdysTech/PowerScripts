@@ -185,7 +185,7 @@ Begin {
                 Exit 
             }
         
-            $index = [int] ($fieldsConf.keys | where {$fieldsConf[$_] -eq $columnName})
+            $index = [int] ($fieldsConf.keys | Where-Object {$fieldsConf[$_] -eq $columnName})
             try {
                 $filter = new-object System.Text.RegularExpressions.Regex ($column.Groups["filter"].value, [System.Text.RegularExpressions.RegexOptions]::Compiled)
             }
@@ -205,12 +205,12 @@ Begin {
     #if date and time are split in two columns, adjust the time format, and build date format
     $timeParts = $splitter.split($time)
     if ($timeParts.count -gt 1) {
-        $dateIndex = [int] ($fieldsConf | where {$_.groups["column"].Value -eq "Date"} | foreach {$_.groups["index"].Value})
+        $dateIndex = [int] ($fieldsConf.keys | Where-Object {$fieldsConf[$_] -eq "Date"})
         if ($dateIndex -eq $null) {
             throw 'Error: The specified field map does not contain field "Date" which is required when the -time format spread across two columns'
             Exit 
         }
-        $timeIndex = [int] ($fieldsConf | where {$_.groups["column"].Value -eq "Timestamp"} | foreach {$_.groups["index"].Value})
+        $timeIndex = [int] ($fieldsConf.keys | Where-Object {$fieldsConf[$_] -eq "Timestamp"})
         $min = if ($dateIndex -gt $timeIndex) { $timeIndex } else { $dateIndex }
         $dateIndex = $dateIndex - $min
         $timeIndex = $timeIndex - $min
@@ -226,7 +226,7 @@ Begin {
         $formula = $column.Groups["formula"].value
         $CalculatedColumn = $column.Groups["column"].value
         $formulaSplitter = [regex] "(?<Metric>.*?):(?<Aggregate>.*?)$"   
-        foreach ($formulaParts in (([regex] "\[(?<column>.*?)\]").Matches($formula) | foreach {$formulaSplitter.Match($_.Groups["column"].Value)})) {
+        foreach ($formulaParts in (([regex] "\[(?<column>.*?)\]").Matches($formula) | ForEach-Object {$formulaSplitter.Match($_.Groups["column"].Value)})) {
             $CalculatedColumnsConf.Add([pscustomobject]@{	
                     CalculatedColumn = $CalculatedColumn 
                     Formula          = $formula
@@ -315,12 +315,12 @@ Begin {
                         }
                         $entry.Add("Metric", $aggr.groups["column"].Value)
                         $entry.Add("Aggregate", $aggr.groups["aggregate"].Value)
-                        $value = , ($group.Group | Select-Object $aggr.groups["column"].Value | foreach {$($_.($aggr.groups["column"].Value)) -as [double]}) | ProcessValues -formula $($entry.Aggregate.ToLower())
+                        $value = , ($group.Group | Select-Object $aggr.groups["column"].Value | ForEach-Object {$($_.($aggr.groups["column"].Value)) -as [double]}) | ProcessValues -formula $($entry.Aggregate.ToLower())
                         $entry.Add("AggregateValue", $Value)
                         $aggregates.Add([PSCustomObject]$entry)
                     }
                     catch [Exception] { 
-                        write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
+                        Write-Host "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
                     }
                 }
             }
@@ -348,7 +348,7 @@ Begin {
                     
                         $formula = $calcCol.Name
                         foreach ($col in $calcCol.Group) {
-                            $val = ($values | where {$_.Metric -eq $col.Metric -and $_.Aggregate -eq $col.Aggregate }).AggregateValue
+                            $val = ($values | Where-Object {$_.Metric -eq $col.Metric -and $_.Aggregate -eq $col.Aggregate }).AggregateValue
                             $formula = $formula.Replace("[$($col.Metric):$($col.Aggregate)]", $val) 
                         }
                         $entry.Add("Metric", $col.CalculatedColumn)
@@ -356,7 +356,7 @@ Begin {
                         $aggregates.Add([PSCustomObject]$entry)
                     }
                     catch [Exception] { 
-                        write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
+                        Write-Host "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
                     }
                 }
             }
@@ -421,7 +421,7 @@ process {
                     }
                 }
                 catch [Exception] { 
-                    write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)" 
+                    Write-Host "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)" 
                 }
             }
             $entries.RemoveAll( { param($e) $e.Timestamp -le $cutoff}) | Out-Null
@@ -441,7 +441,7 @@ process {
             }
         }
         catch [Exception] { 
-            write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)" 
+            Write-Host "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)" 
         }
     }
     
@@ -450,7 +450,7 @@ process {
         $completedLines = $entries[$entries.Count - 1].Line
     }
     else {
-        $completedLines = ($entries | Where-Object {$_.Timestamp -le ($entries[$entries.Count - 1].Timestamp.AddMinutes( - $Interval))} | select -last 1).Line
+        $completedLines = ($entries | Where-Object {$_.Timestamp -le ($entries[$entries.Count - 1].Timestamp.AddMinutes( - $Interval))} | Select-Object -last 1).Line
     }
 
         

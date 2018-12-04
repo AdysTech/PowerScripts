@@ -28,7 +28,7 @@ Param (
     
     #AD Group, any user invoking the URLs in this server should be part of this group. 
     [Parameter()]
-    [string] $primaryGroup = "PsJobSchedulers"
+    [string] $primaryGroup = "BUILTIN\Performance Log Users"
 )
 
 $DebugPreference = "Continue"
@@ -139,8 +139,11 @@ Function Log-AuditMessage {
 
 Function GetProcessStatus {
     #read only transaction.. may not get latest one in a race condition
-    $statusEntries = Get-Content -Raw -Path $(Resolve-path "./ProcessStatus.json") | ConvertFrom-Json
-    return $statusEntries
+    if (Test-Path "./ProcessStatus.json") {
+        $statusEntries = Get-Content -Raw -Path $(Resolve-path "./ProcessStatus.json") | ConvertFrom-Json
+        return $statusEntries
+    }
+    else {return $null}
 }
 
 Function UpdateProcessStatus {
@@ -167,6 +170,7 @@ Function UpdateProcessStatus {
                 $statusEntries.Processes += $t
             }
         }
+        $statusEntries.Processes = @($statusEntries.Processes | Where-Object { $_.RunId -ne $process.RunId})
         $statusEntries.Processes += $process
         $statusEntries | ConvertTo-Json -Depth 100 | Out-File $path
     }
@@ -193,10 +197,12 @@ Function ArchiveProcessEntries {
             
         $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
         $now = [DateTime]::Now
-        $archiveEntries = $statusEntries.Processes | Where-Object { $_.Status -eq "Completed" -and $_.StartTime + $TimeToLive -lt $now}
-        $statusEntries.Processes = $statusEntries.Processes | Where-Object { $_.Status -ne "Completed" -or $_.StartTime + $TimeToLive -gt $now}
+        write-verbose "Total entries - $($statusEntries.Processes.Count)"
+        $archiveEntries = $statusEntries.Processes | Where-Object { $_.EndTime -ne $null -and $_.StartTime + $TimeToLive -lt $now}
+        write-verbose "Entries that can be archived - $($archiveEntries.Count)"
+        $statusEntries.Processes = $statusEntries.Processes | Where-Object { $_.EndTime -eq $null -or $_.StartTime + $TimeToLive -gt $now}       
+        write-verbose "Total entries remaining - $($statusEntries.Processes.Count)"
         $statusEntries | ConvertTo-Json -Depth 100 | Out-File $path
-
         $archive = ".\ProcessArchive-$($now.ToString('MMM')).json"
         if (-not(test-path $archive)) {
             New-Item $archive -Force -ItemType File | out-null
@@ -288,27 +294,28 @@ $sessionstate.Variables.Add(
 $jobWatchercallback = {     
     $VerbosePreference = "Continue"
     $DebugPreference = "Continue"
-    
-    try {
-        if ($Event.MessageData.jobQueue.Count -gt 0 -or $Event.MessageData.jobOutput.Count -gt 0) {
-            while ($Event.MessageData.jobQueue.Count -gt 0) {                    
-                $arguemnts = $Event.MessageData.jobQueue.Dequeue()
-                try {                    
-                    $PSinstance = [PowerShell]::Create()                    
-                    $PSinstance.AddCommand("ExecuteScriptAsync").AddArgument($arguemnts.WorkingDir).AddArgument($arguemnts.Script).AddArgument($arguemnts.CommandArgs).AddArgument($arguemnts.RunId)
-                    $PSinstance.RunspacePool = $Event.MessageData.runspacePool
-                    $Event.MessageData.jobOutput.$("Job$($arguemnts.RunId)") = ([PSCustomObject]@{
-                            Runspace   = $PSinstance.BeginInvoke()
-                            PowerShell = $PSinstance
-                            RunID      = $arguemnts.RunId
-                        })
-                    Write-Verbose "$([datetime]::Now) Started async processing $($arguemnts.RunId) with $($arguemnts.CommandArgs)"
-                }
-                catch [Exception] { 
-                    write-verbose "Error starting the RunSpace $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
-                    $Event.MessageData.jobQueue.Enqueue($arguemnts)
-                }                    
-            }        
+    #Write-debug "$([datetime]::Now) Queue Length $($Event.MessageData.jobQueue.Count)"
+    $modified = $false
+    try {        
+        while ($Event.MessageData.jobQueue.Count -gt 0) {                    
+            $arguemnts = $Event.MessageData.jobQueue.Dequeue()
+            try {                    
+                $PSinstance = [PowerShell]::Create()                    
+                $PSinstance.AddCommand("ExecuteScriptAsync").AddArgument($arguemnts.WorkingDir).AddArgument($arguemnts.Script).AddArgument($arguemnts.CommandArgs).AddArgument($arguemnts.RunId)
+                $PSinstance.RunspacePool = $Event.MessageData.runspacePool
+                $Event.MessageData.jobOutput.$("Job$($arguemnts.RunId)") = ([PSCustomObject]@{
+                        Runspace   = $PSinstance.BeginInvoke()
+                        PowerShell = $PSinstance
+                        RunID      = $arguemnts.RunId
+                    })
+                Write-Verbose "$([datetime]::Now) Started async processing $($arguemnts.RunId) with $($arguemnts.CommandArgs)"
+            }
+            catch [Exception] { 
+                write-verbose "Error starting the RunSpace $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
+                $Event.MessageData.jobQueue.Enqueue($arguemnts)
+            }                    
+        }
+        if ( $Event.MessageData.jobOutput.Count -gt 0) {        
             $Event.MessageData.jobOutput.GetEnumerator().Where( {$_.Value.Runspace.IsCompleted}).foreach( {
                     $job = $_.Value
                     Write-Verbose "$([datetime]::Now) Finalize async processing for $($job.RunId)"
@@ -328,14 +335,21 @@ $jobWatchercallback = {
                         $err |foreach-Object {$entries.Add($_.ToString())}
                     }
                     $entries.Add("Output`n")
-                    $entries.Add( "----------------------------------------------`n")
-                    $out = $job.PowerShell.EndInvoke($job.Runspace)
+                    $entries.Add( "-----------------------$($job.PowerShell.InvocationStateInfo.State)-----------------------`n")
                     
+                    if ($job.PowerShell.InvocationStateInfo.State -eq 'Completed') {
+                        $out = $job.PowerShell.EndInvoke($job.Runspace) 
+                    }
+                    elseif ($job.PowerShell.InvocationStateInfo.State -eq 'Stopped') {
+                        $out = $job.PowerShell.EndStop($job.Runspace) 
+                    }
+                        
                     if ($out -ne $null) {
                         $out|foreach-Object {if ($_ -ne $null) {[string]$o = $_; $entries.Add($o)}
                         }
                     }
                     $entries | Out-File -FilePath $log -Append | out-null
+                    $job.Runspace = $null
                     $job.PowerShell.Dispose()
                     $Event.MessageData.jobOutput.Remove("Job$($job.RunId)")
                 })            
@@ -360,6 +374,10 @@ $listenerCallback = {
         [string] $primaryGroup
     )
 
+    [long] $requestCount = 0
+    [long] $errorCount = 0
+    $CommandKeywords = "status;archivejobs;runoutput;canceljob;procstatus;"
+    
     try {
         while ($listener.IsListening) {
             try {
@@ -370,7 +388,8 @@ $listenerCallback = {
                 #write-verbose "$requestCount  -  Received a request - $runID"
                 
                 $request = $context.Request
-                    
+                
+    
                 if (!$request.IsAuthenticated) {
                     $statusCode = 403
                     $commandOutput = @{Success = $false; Error = "Unauthorized"; Message = "Rejected request as user was not authenticated"}
@@ -385,6 +404,7 @@ $listenerCallback = {
                         $commandOutput = @{Success = $false; Error = "Unauthorized"; Message = "Rejected request as user is not in allowed group"}
                     }
                     else {
+                        #Write-Verbose "QueryString.HasKeys $($request.QueryString.HasKeys())"
                         if (-not $request.QueryString.HasKeys()) {
                             $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "No Input provided!! Refer to user guide"}
                         }
@@ -406,120 +426,153 @@ $listenerCallback = {
                                     $reader.Close()
                                 }
                             }
-                            
-                            switch ($command) {
-                                status {
-                                    $processes = $(GetProcessStatus).Processes
+                            if (-not ($CommandKeywords.Contains("$command;"))) {
+                                $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "Invalid command selected"}
+                                $statusCode = 501;
+                            }
+                            else {
+                                switch ($command) {
+                                    status {
+                                        $processes = $(GetProcessStatus).Processes
                                     
-                                    if ( $request.QueryString["runid"] -ne $null) {                                
-                                        $commandOutput = @{Success = $True; RunID = $runId; Process = ($Processes | Where-Object {$_.RunId -eq $request.QueryString["runid"]})}
-                                    }
-                                    else {
-                                        $commandOutput = @{Success = $True; RunID = $runId; Processes = $processes}    
-                                    }
-                                    break
-                                }
-                                archivejobs {
-                                    $res = ArchiveProcessEntries $([TimeSpan]::FromHours(24))
-                                    $processes = $(GetProcessStatus).Processes
-                                    $commandOutput = @{Success = $res; RunID = $runId; Processes = $processes}    
-                                    break
-                                }
-                                runoutput {
-                                    if ( $request.QueryString["runid"] -ne $null) {
-                                        $log = ".\Logs\$($request.QueryString["runid"]).log"
-                                        if ((Test-Path $log) -and ($content = $((Get-Content $log) -join "`n`n")) -and (-not([string]::IsNullOrEmpty($content)))) {
-                                            try {
-                                                Send-Response $statusCode $context.Response "TEXT" $((Get-Content $log) -join "`n")
-                                            }
-                                            catch {
-                                                $statusCode = 500
-                                                @{Success = $false; Error = "UnableToProcess"; Message = "Unable to Process request"}; 
-                                            }
+                                        if ( $request.QueryString["runid"] -ne $null) {                                
+                                            $commandOutput = @{Success = $True; RunID = $runId; Process = ($Processes | Where-Object {$_.RunId -eq $request.QueryString["runid"]})}
                                         }
                                         else {
-                                            Send-Response 404 $context.Response "TEXT" "File Not Found"
+                                            $commandOutput = @{Success = $True; RunID = $runId; Processes = $processes}    
                                         }
-                                        continue
+                                        break
                                     }
-                                    break
-                                }
-                                Default {
-                                  
-    
-                                    $script = "./Execute_$command.ps1" 
-                                    if (-not(Test-Path $script)) {
-                                        $statusCode = 500
-                                        @{Success = $false; Error = "InvalidInput"; Message = "Command $command is not known!!"}; 
-                                    }
-                                    else {  
-                                        $script = Resolve-Path $script
-                                        if ( $request.QueryString["async"] -ne $null) {                                          
-                                            if ($postArgs -eq $null) {
-                                                $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "Invalid POST data!! Refer to user guide"}
-                                            }
-                                            else {
-                                                
-                                                $process = [PsCustomObject] @{
-                                                    StartTime = [DateTime]::Now
-                                                    User      = $user
-                                                    Command   = $command
-                                                    Status    = "Queued"
-                                                    RunID     = $runId
-                                                    EndTime   = $null
-                                                    Arguments = $postArgs
-                                                }
-                                                
-                                                if ( UpdateProcessStatus $process) {
-                                                    
-                                                    $jobQueue.Enqueue([pscustomobject]@{
-                                                            WorkingDir  = $workingDir
-                                                            Script      = $script 
-                                                            CommandArgs = $postArgs 
-                                                            RunId       = $runId
-                                                        })
-                                                    
-                                                    Write-Debug "$([datetime]::Now) Queued request $runId, Queue Length: $($jobQueue.Count)"
-                                                    
+                                    canceljob {                                        
+                                        if ( $request.QueryString["runid"] -ne $null) {
+                                            Write-Debug "Trying to cancel job RunID: $($request.QueryString["runid"])"
+                                            Write-Debug "Job count: $($jobOutput.Count)"
+                                            if ( $jobOutput.Count -gt 0) {
+                                                $job = $jobOutput.GetEnumerator().Where( {$_.Value.RunID -eq $request.QueryString["runid"]}) | Select-Object -First 1 
+                                                $job = $job.Value
+                                                if ($job -ne $null) {
+                                                    Write-Debug "Got job : $job "
+                                                    $job.Runspace = $job.PowerShell.BeginStop($null, $null)
+
+                                                    $process = $(GetProcessStatus).Processes | Where-Object {$_.RunId -eq $request.QueryString["runid"]}
+                                                    $process.Status = "Cancelled"
+                                                    $process.EndTime = [DateTime]::Now
+                                                    UpdateProcessStatus $process 
                                                     $commandOutput = @{Success = $True; RunID = $runId; Process = $process}
                                                 }
                                                 else {
-                                                    $commandOutput = @{Success = $False; RunID = $runId; Process = $process}
+                                                    $commandOutput = @{Success = $false; RunID = $runId; } 
                                                 }
                                             }
-                                            
+                                            else {
+                                                $commandOutput = @{Success = $false; RunID = $runId; } 
+                                            }
                                         }
                                         else {
-                                            try {
-                                                $commandArgs = @{}
-                                                $request.QueryString.Keys | ForEach-Object {$commandArgs.Add($_, $request.QueryString[$_])}
-                                                if ($postArgs -ne $null) {
-                                                    $postArgs | Get-Member -MemberType NoteProperty |ForEach-Object {
-                                                        if (-not $commandArgs.ContainsKey($_.Name)) {
-                                                            $commandArgs.Add($_.Name, $postArgs.($_.Name))
-                                                        }
-                                                    }
-                                                    
+                                            $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "Invalid command selected"}
+                                            $statusCode = 501;
+                                        }
+                                        break
+                                    }
+                                    archivejobs {
+                                        $res = ArchiveProcessEntries $([TimeSpan]::FromHours(24))
+                                        $processes = $(GetProcessStatus).Processes
+                                        $commandOutput = @{Success = $res; RunID = $runId; Processes = $processes}    
+                                        break
+                                    }
+                                    runoutput {
+                                        if ( $request.QueryString["runid"] -ne $null) {
+                                            $log = ".\Logs\$($request.QueryString["runid"]).log"
+                                            if ((Test-Path $log) -and ($content = $((Get-Content $log) -join "`n`n")) -and (-not([string]::IsNullOrEmpty($content)))) {
+                                                try {
+                                                    Send-Response $statusCode $context.Response "TEXT" $((Get-Content $log) -join "`n")
                                                 }
-                                                
-                                                $results = ExecuteScript -script $script -arguments $([pscustomobject]$commandArgs)
-                                                $commandOutput = @{Success = $True; RunID = $runId; Results = @($results) }
+                                                catch {
+                                                    $statusCode = 500
+                                                    @{Success = $false; Error = "UnableToProcess"; Message = "Unable to Process request"}; 
+                                                }
                                             }
-                                            catch {
-                                                write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
-                                                @{Success = $false; Error = "UnableToProcess"; Message = "Unable to Process request"}; 
-                                                $statusCode = 500
+                                            else {
+                                                Send-Response 404 $context.Response "TEXT" "File Not Found"
+                                            }
+                                            continue
+                                        }
+                                        break
+                                    }
+                                    Default {
+                                        $script = "./Execute_$command.ps1" 
+                                        if (-not(Test-Path $script)) {
+                                            $statusCode = 500
+                                            @{Success = $false; Error = "InvalidInput"; Message = "Command $command is not known!!"}; 
+                                        }
+                                        else {  
+                                            $script = Resolve-Path $script
+                                            if ( $request.QueryString["async"] -ne $null) {                                          
+                                                if ($postArgs -eq $null) {
+                                                    $commandOutput = @{Success = $false; Error = "InvalidInput"; Message = "Invalid POST data!! Refer to user guide"}
+                                                }
+                                                else {
+                                                
+                                                    $process = [PsCustomObject] @{
+                                                        StartTime = [DateTime]::Now
+                                                        User      = $user
+                                                        Command   = $command
+                                                        Status    = "Queued"
+                                                        RunID     = $runId
+                                                        EndTime   = $null
+                                                        Arguments = $postArgs
+                                                    }
+                                                
+                                                    if ( UpdateProcessStatus $process) {
+                                                    
+                                                        $jobQueue.Enqueue([pscustomobject]@{
+                                                                WorkingDir  = $workingDir
+                                                                Script      = $script 
+                                                                CommandArgs = $postArgs 
+                                                                RunId       = $runId
+                                                            })
+                                                    
+                                                        Write-Debug "$([datetime]::Now) Queued request $runId, Queue Length: $($jobQueue.Count)"
+                                                    
+                                                        $commandOutput = @{Success = $True; RunID = $runId; Process = $process}
+                                                    }
+                                                    else {
+                                                        $commandOutput = @{Success = $False; RunID = $runId; Process = $process}
+                                                    }
+                                                }
+                                            
+                                            }
+                                            else {
+                                                try {
+                                                    $commandArgs = @{}
+                                                    $request.QueryString.Keys | ForEach-Object {$commandArgs.Add($_, $request.QueryString[$_])}
+                                                    if ($postArgs -ne $null) {
+                                                        $postArgs | Get-Member -MemberType NoteProperty |ForEach-Object {
+                                                            if (-not $commandArgs.ContainsKey($_.Name)) {
+                                                                $commandArgs.Add($_.Name, $postArgs.($_.Name))
+                                                            }
+                                                        }
+                                                    
+                                                    }
+                                                
+                                                    $results = ExecuteScript -script $script -arguments $([pscustomobject]$commandArgs)
+                                                    $commandOutput = @{Success = $True; RunID = $runId; Results = @($results) }
+                                                }
+                                                catch {
+                                                    write-verbose "Error $($_.Exception.Message) at $($_.InvocationInfo.PositionMessage)"
+                                                    @{Success = $false; Error = "UnableToProcess"; Message = "Unable to Process request"}; 
+                                                    $statusCode = 500
+                                                }
                                             }
                                         }
                                     }
                                 }
-                            }
                             
+                            }
                         }
                     }
-                }
     
-                
+                }
                 if (!$commandOutput) {
                     $commandOutput = " "
                 }
@@ -539,7 +592,13 @@ $listenerCallback = {
     }
 }
 
-
+##clear old abondend jobs
+if (Test-Path ".\ProcessStatus.json") {
+    $path = $(Resolve-path ".\ProcessStatus.json")
+    $statusEntries = Get-Content -Raw -Path $path | ConvertFrom-Json
+    $statusEntries.Processes | Where-Object { $_.EndTime -eq $null} | ForEach-Object {$_.Status = 'Cancelled'; $_.EndTime = [DateTime]::Now}
+    $statusEntries | ConvertTo-Json -Depth 100 | Out-File $path
+}
 
 $MaxActiveProcess = $env:NUMBER_OF_PROCESSORS - 2
 $runspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxActiveProcess, $sessionstate, $Host)
@@ -550,7 +609,7 @@ $jobWatcherTimer.Interval = 5000
 $jobWatcherTimer.AutoReset = $true
 $jobWatcherTimer.Enabled = $true
 $timerState = [PSObject] @{JobQueue = $jobQueue; jobOutput = $jobOutput; RunspacePool = $runspacePool}
-Register-ObjectEvent -InputObject $jobWatcherTimer -EventName Elapsed -SourceIdentifier  timerEvntId -Action $jobWatchercallback -MessageData $timerState | Out-Null
+$timerEvent = Register-ObjectEvent -InputObject $jobWatcherTimer -EventName Elapsed -SourceIdentifier  timerEvntId -Action $jobWatchercallback -MessageData $timerState
 $ErrorActionPreference = "Stop"
 
 $CurrentPrincipal = New-Object Security.Principal.WindowsPrincipal( [Security.Principal.WindowsIdentity]::GetCurrent())

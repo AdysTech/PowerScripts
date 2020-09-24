@@ -4,7 +4,7 @@ Usually access logs capture information for each hit, and that is too much infor
 
 ### Usage
 
-`AccessLogParser.ps1 -HostName jboss_host123 -source ".\access_log.2016-05-08.log"  -target "./access_log_analysis.csv" -fields "3:Timestamp;7:Url;10:HttpCode;11:PageSize;12:TimeTaken" -filter "Url;jpg$" -group "Url;HttpCode" -aggregate "HttpCode:Count;PageSize:Sum;TimeTaken:Percentile_90;TimeTaken:Average" -calculate "Concurrency=(([HttpCode:Count]/300)*([TimeTaken:Average]/1000))" -time "[dd/MMM/yyyy:HH:mm:ss" -Interval 5 -split " "`
+`Invoke-AccessLogParser -HostName jboss_host123 -source ".\access_log.2020-05-08.log"  -target "./access_log_analysis.csv" -fields "3:Timestamp;7:Url;10:HttpCode;11:PageSize;12:TimeTaken" -filter "Url;jpg$" -group "Url;HttpCode" -aggregate "HttpCode:Count;PageSize:Sum;TimeTaken:Percentile_90;TimeTaken:Average" -calculate "Concurrency=(([HttpCode:Count]/300)*([TimeTaken:Average]/1000))" -time "[dd/MMM/yyyy:HH:mm:ss" -Interval 5 -split " "`
 
 ### PARAMETERS
 ####    -source <String>
